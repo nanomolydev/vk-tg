@@ -1,0 +1,125 @@
+name: Build
+
+# Builds this fork and publishes an installable .ipa. The Telegram UI is the
+# whole point of the fork; the VK data layer lands on top of it later.
+on:
+  push:
+    branches: [main, master, vk]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Bazel's cache is the difference between 45 minutes and a few — same
+      # trick that took the other app's build from 11 minutes to one.
+      - name: Cache Bazel
+        uses: actions/cache@v4
+        with:
+          path: ~/tg-bazel-cache
+          key: bazel-${{ runner.os }}-xc262-${{ github.sha }}
+          restore-keys: |
+            bazel-${{ runner.os }}-xc262-
+
+      # They pin the toolchain in versions.json and refuse anything else.
+      - name: Select Xcode 26.2
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.2.app/Contents/Developer
+          xcodebuild -version
+
+      - name: Version
+        run: echo "VERSION=1.0.${{ github.run_number }}" >> $GITHUB_ENV
+
+      - name: Configuration
+        run: |
+          # Bundle id and team must match the bundled fake profiles, or Bazel
+          # can't resolve the provisioning targets.
+          cat > /tmp/cfg.json <<EOF
+          {
+            "bundle_id": "ph.telegra.Telegraph",
+            "api_id": "1",
+            "api_hash": "0123456789abcdef0123456789abcdef",
+            "team_id": "C67CF9S4VU",
+            "app_center_id": "0",
+            "is_internal_build": "true",
+            "is_appstore_build": "false",
+            "appstore_id": "0",
+            "app_specific_url_scheme": "tg",
+            "premium_iap_product_id": "",
+            "enable_siri": false,
+            "enable_icloud": false
+          }
+          EOF
+
+      # Push doesn't exist on a sideloaded unsigned build; their gate would
+      # otherwise stop the build outright.
+      - name: Relax the push-entitlement gate
+        run: |
+          python3 - <<'EOF'
+          p = 'build-system/Make/Make.py'
+          s = open(p).read()
+          s = s.replace(
+              "    if codesigning_data.aps_environment is None:\n"
+              "        print('Could not find a valid aps-environment entitlement in the provided provisioning profiles')\n"
+              "        sys.exit(1)\n",
+              "    if codesigning_data.aps_environment is None:\n"
+              "        codesigning_data.aps_environment = 'development'\n")
+          open(p, 'w').write(s)
+          EOF
+
+      - name: Build
+        run: |
+          set -o pipefail
+          python3 build-system/Make/Make.py \
+            --cacheDir="$HOME/tg-bazel-cache" \
+            build \
+            --configurationPath=/tmp/cfg.json \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --buildNumber=${{ github.run_number }} \
+            --configuration=release_arm64 2>&1 | tail -40
+
+      - name: Collect the ipa
+        run: |
+          IPA=$(find bazel-bin bazel-out -name "*.ipa" 2>/dev/null | head -1)
+          echo "found: $IPA"
+          cp "$IPA" ./VKTelegram.ipa
+          ls -la VKTelegram.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VKTelegram-ipa
+          path: VKTelegram.ipa
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v$VERSION" VKTelegram.ipa \
+            --title "v$VERSION" --notes "$(git log -1 --pretty=%s)"
+
+      # Ping the chat when it's done, success or not. Skipped silently if the
+      # secrets aren't set.
+      - name: Tell Telegram
+        if: always()
+        env:
+          TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          CHAT: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          [ -z "$TOKEN" ] && { echo "no TG_BOT_TOKEN secret, skipping"; exit 0; }
+          if [ "${{ job.status }}" = "success" ]; then
+            TEXT="✅ vk-tg v$VERSION собрался — https://github.com/${{ github.repository }}/releases/latest"
+          else
+            TEXT="❌ vk-tg v$VERSION упал — https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          fi
+          curl -s -X POST "https://api.telegram.org/bot$TOKEN/sendMessage" \
+            --data-urlencode "chat_id=$CHAT" \
+            --data-urlencode "text=$TEXT" > /dev/null
+          echo "notified"
