@@ -75,27 +75,37 @@ jobs:
           open(p, 'w').write(s)
           EOF
 
-      # The device build signs its extensions, and the runner keychain has no
-      # matching identity. They ship a self-signed one for exactly this.
+      # The device build signs its extensions and the runner keychain has no
+      # identity. Their self-signed one is valid until 2030, but it has to be
+      # imported with its private key, trusted, and left in the search list —
+      # otherwise codesign reports zero usable identities.
       - name: Import the bundled signing identity
         run: |
-          KC=build.keychain
-          security create-keychain -p "" $KC
-          security default-keychain -s $KC
-          security unlock-keychain -p "" $KC
-          security set-keychain-settings -t 3600 -u $KC
-          for PW in "" "password" "123456"; do
+          set -x
+          KC="$HOME/build.keychain-db"
+          security create-keychain -p pass "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p pass "$KC"
+          security list-keychains -d user -s "$KC" login.keychain-db
+          security default-keychain -s "$KC"
+
+          for PW in "" "password" "123456" "telegram"; do
             if security import build-system/fake-codesigning/certs/SelfSigned.p12 \
-                 -k $KC -P "$PW" -T /usr/bin/codesign -T /usr/bin/security 2>/dev/null; then
-              echo "imported with password: '$PW'"; break
+                 -k "$KC" -P "$PW" -A -t agg -f pkcs12 2>/dev/null; then
+              echo "p12 imported, password='$PW'"; break
             fi
           done
-          security import build-system/fake-codesigning/certs/Public.cer -k $KC \
-            -T /usr/bin/codesign 2>/dev/null || true
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" $KC >/dev/null 2>&1 || true
-          echo "=== identities ==="
-          security find-identity -v $KC || true
-          security find-identity -v -p codesigning $KC || true
+          security import build-system/fake-codesigning/certs/Public.cer \
+            -k "$KC" -A -t cert -f openssl 2>/dev/null || true
+          # Self-signed means untrusted, and untrusted means "not valid".
+          sudo security add-trusted-cert -d -r trustRoot \
+            -k /Library/Keychains/System.keychain \
+            build-system/fake-codesigning/certs/Public.cer || true
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k pass "$KC" >/dev/null 2>&1 || true
+
+          echo "=== all identities ==="; security find-identity "$KC" || true
+          echo "=== valid for codesigning ==="; security find-identity -v -p codesigning "$KC" || true
 
       - name: Build
         run: |
